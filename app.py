@@ -96,11 +96,31 @@ def plot_kline(hist, ticker_name):
     return fig
 
 def generate_gemini_analysis(ticker, hist, info, api_key):
-    """呼叫 Gemini 產生分析報告 (已切換為最穩定的 gemini-pro 模型)"""
+    """呼叫 Gemini 產生分析報告 (終極防錯版：自動尋找可用模型)"""
     try:
         genai.configure(api_key=api_key)
-        # 🔑 重點修改：強制雲端環境使用全球通用、最穩定的模型
-        model = genai.GenerativeModel('gemini-pro') 
+        
+        # 🔍 自動尋找您的 API Key 真正支援的模型
+        valid_model_name = ""
+        for m in genai.list_models():
+            if 'generateContent' in m.supported_generation_methods:
+                # 優先選擇含有 flash 或 pro 的最新模型
+                if 'flash' in m.name or 'pro' in m.name:
+                    valid_model_name = m.name
+                    break
+        
+        # 如果沒找到 flash 或 pro，就挑選清單中第一個支援生成的模型
+        if not valid_model_name:
+            for m in genai.list_models():
+                if 'generateContent' in m.supported_generation_methods:
+                    valid_model_name = m.name
+                    break
+                    
+        if not valid_model_name:
+            return "⚠️ 您的 API Key 目前無法存取任何文字生成模型，請確認 Google AI Studio 帳號狀態。", None
+
+        # 使用系統自動找到的合法模型
+        model = genai.GenerativeModel(valid_model_name) 
         
         latest = hist.iloc[-1]
         prompt = f"""
@@ -119,10 +139,13 @@ def generate_gemini_analysis(ticker, hist, info, api_key):
         4. 💡 總結建議：一句話總結策略。
         """
         response = model.generate_content(prompt)
-        return response.text, latest
+        
+        # 在報告開頭印出這次成功使用的模型名稱，方便我們確認
+        final_report = f"*(系統自動選用模型: {valid_model_name})*\n\n" + response.text
+        return final_report, latest
+        
     except Exception as e:
         return f"⚠️ AI 分析錯誤：{e}", None
-
 # --- 載入台股清單 ---
 stock_df = get_taiwan_stock_list()
 
