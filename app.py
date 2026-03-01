@@ -96,11 +96,11 @@ def plot_kline(hist, ticker_name):
     return fig
 
 def generate_gemini_analysis(ticker, hist, info, api_key):
-    """呼叫 Gemini 產生分析報告 (修復 404 問題)"""
+    """呼叫 Gemini 產生分析報告 (已切換為最穩定的 gemini-pro 模型)"""
     try:
         genai.configure(api_key=api_key)
-        # 更新為最新的模型後綴
-        model = genai.GenerativeModel('gemini-1.5-flash-latest') 
+        # 🔑 重點修改：強制雲端環境使用全球通用、最穩定的模型
+        model = genai.GenerativeModel('gemini-pro') 
         
         latest = hist.iloc[-1]
         prompt = f"""
