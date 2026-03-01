@@ -54,7 +54,7 @@ def register_user(username, password):
         conn.commit()
         return True
     except sqlite3.IntegrityError:
-        return False # 帳號已存在
+        return False 
     finally:
         conn.close()
 
@@ -64,7 +64,7 @@ def authenticate_user(username, password):
     c.execute("SELECT id, api_key FROM users WHERE username=? AND password=?", (username, hash_pw(password)))
     user = c.fetchone()
     conn.close()
-    return user # 回傳 (id, api_key) 或 None
+    return user 
 
 def update_api_key_db(user_id, api_key):
     conn = sqlite3.connect('stock_app.db')
@@ -102,11 +102,10 @@ def remove_favorite(user_id, symbol):
     conn.commit()
     conn.close()
 
-# 初始化資料庫
 init_db()
 
 # ==========================================
-# 🔄 股票資料與 AI 分析函數 (保留原有邏輯)
+# 🔄 股票資料與 AI 分析函數
 # ==========================================
 @st.cache_data(ttl=86400)
 def get_taiwan_stock_list():
@@ -162,10 +161,6 @@ def plot_kline(hist, ticker_name):
     fig.add_trace(go.Scatter(x=hist.index, y=hist['D'], line=dict(color='blue', width=1.5), name='D值'), row=3, col=1)
     fig.add_hline(y=80, line_dash="dot", line_color="red", row=3, col=1)
     fig.add_hline(y=20, line_dash="dot", line_color="green", row=3, col=1)
-    fig.add_layout_image(
-        dict(source="https://upload.wikimedia.org/wikipedia/commons/thumb/c/c1/Google_%22G%22_logo.svg/1024px-Google_%22G%22_logo.svg.png",
-             xref="paper", yref="paper", x=0.5, y=0.5, sizex=0.3, sizey=0.3, xanchor="center", yanchor="middle", opacity=0.05, layer="below")
-    )
     fig.update_layout(title=f"{ticker_name} 進階技術分析", xaxis_rangeslider_visible=False, height=750)
     return fig
 
@@ -213,7 +208,6 @@ if 'username' not in st.session_state:
 if 'api_key' not in st.session_state:
     st.session_state['api_key'] = ""
 
-# --- 登入/註冊畫面 ---
 if not st.session_state['logged_in']:
     st.title("🔐 AI 股票分析系統 - 登入")
     tab1, tab2 = st.tabs(["登入", "註冊新帳號"])
@@ -245,10 +239,8 @@ if not st.session_state['logged_in']:
                     st.success("註冊成功！請切換到「登入」標籤登入系統。")
                 else:
                     st.error("此帳號已被使用，請換一個。")
-    st.stop() # 停止執行後續的主畫面程式碼
+    st.stop() 
 
-# --- 登入後的主畫面系統 ---
-# 初始化狀態
 if 'search_results' not in st.session_state:
     st.session_state['search_results'] = pd.DataFrame()
 if 'selected_symbol' not in st.session_state:
@@ -283,10 +275,10 @@ with st.sidebar:
     
     if not fav_df.empty:
         for index, row in fav_df.iterrows():
-            if st.button(f"{row['Ticker']} {row['Name']}", key=f"fav_{row['Symbol']}", use_container_width=True):
-                # 點擊最愛時：讀取資料庫中的舊報告，不重新分析
-                st.session_state['selected_symbol'] = row['Symbol']
-                st.session_state['display_name'] = f"{row['Ticker']} {row['Name']}"
+            # 🐛 這裡已修正：全改用小寫欄位名稱 (ticker, name, symbol, report)
+            if st.button(f"{row['ticker']} {row['name']}", key=f"fav_{row['symbol']}", use_container_width=True):
+                st.session_state['selected_symbol'] = row['symbol']
+                st.session_state['display_name'] = f"{row['ticker']} {row['name']}"
                 st.session_state['current_report'] = row['report']
                 st.session_state['report_time'] = row['update_time']
                 st.session_state['needs_new_analysis'] = False
@@ -296,7 +288,6 @@ with st.sidebar:
 # --- 主畫面區塊 ---
 st.title("📊 股票進階指標與 AI 分析系統")
 
-# 1. 搜尋區
 col_s1, col_s2 = st.columns([4, 1])
 with col_s1:
     search_query = st.text_input("輸入名稱或代碼 (如: 友達, 2409.TW)：", key="search_input")
@@ -312,7 +303,6 @@ with col_s2:
             st.session_state['display_name'] = search_query.upper()
             st.session_state['needs_new_analysis'] = True
 
-# 2. 選單區 (如果有搜尋到)
 if not st.session_state['search_results'].empty:
     st.markdown("---")
     results_df = st.session_state['search_results']
@@ -320,12 +310,10 @@ if not st.session_state['search_results'].empty:
     selected_option = st.selectbox("👉 請選擇精確標的：", options.tolist())
     
     if st.button("進行深度分析", type="primary"):
-        # 進行全新搜尋時，強制重新分析
         st.session_state['selected_symbol'] = selected_option.split("(")[-1].replace(")", "")
         st.session_state['display_name'] = selected_option.split(" (")[0]
         st.session_state['needs_new_analysis'] = True
 
-# 3. 分析與圖表呈現區塊
 if st.session_state['selected_symbol']:
     st.markdown("---")
     target_symbol = st.session_state['selected_symbol']
@@ -335,13 +323,9 @@ if st.session_state['selected_symbol']:
     hist_data, stock_info = get_stock_data(target_symbol)
     
     if not hist_data.empty:
-        # K線圖(永遠抓最新報價來畫圖)
         st.plotly_chart(plot_kline(hist_data, display_title), use_container_width=True)
-        
-        # 準備 AI 報告
         st.markdown("### 🤖 專屬 AI 操盤手報告")
         
-        # 判斷是否需要呼叫 API 產生新報告
         if st.session_state['needs_new_analysis']:
             if st.session_state['api_key']:
                 with st.spinner('正在為您產生最新 AI 分析...'):
@@ -350,25 +334,23 @@ if st.session_state['selected_symbol']:
                     st.session_state['report_time'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
                     st.session_state['needs_new_analysis'] = False
                     
-                    # 如果這檔股票已經在最愛清單，自動更新資料庫裡的報告
-                    if target_symbol in fav_df['Symbol'].values:
+                    # 🐛 這裡已修正：改用小寫的 symbol
+                    if target_symbol in fav_df['symbol'].values:
                         ticker = display_title.split(" ")[0] if " " in display_title else target_symbol
                         save_favorite_report(user_id, ticker, display_title, target_symbol, ai_report)
             else:
                 st.warning("⚠️ 請先在左側邊欄設定您的 Gemini API Key。")
         
-        # 顯示報告與操作按鈕
         if st.session_state['current_report']:
             st.caption(f"🕒 報告產出時間: {st.session_state['report_time']} (圖表報價為即時讀取)")
             st.info(st.session_state['current_report'])
             
-            # 檢查是否已在最愛名單中
-            is_fav = target_symbol in fav_df['Symbol'].values
+            # 🐛 這裡已修正：改用小寫的 symbol
+            is_fav = target_symbol in fav_df['symbol'].values
             
             col_b1, col_b2, col_b3 = st.columns([2, 2, 4])
             with col_b1:
                 if is_fav:
-                    # 如果是最愛，顯示「重新取得」與「移除」按鈕
                     if st.button("🔄 重新取得最新 AI 分析", use_container_width=True):
                         st.session_state['needs_new_analysis'] = True
                         st.rerun()
@@ -379,14 +361,12 @@ if st.session_state['selected_symbol']:
                         st.success("已移除！")
                         st.rerun()
                 else:
-                    # 如果不是最愛，顯示「加入最愛」按鈕
                     if st.button("❤️ 將此報告加入我的最愛", use_container_width=True, type="primary"):
                         ticker = display_title.split(" ")[0] if " " in display_title else target_symbol
                         save_favorite_report(user_id, ticker, display_title, target_symbol, st.session_state['current_report'])
                         st.success("已儲存報告至最愛！")
                         st.rerun()
             
-            # 下載 TXT 功能
             export_content = f"【{display_title} AI 實戰分析】\n產出時間:{st.session_state['report_time']}\n\n{st.session_state['current_report']}"
             st.download_button("📥 下載此份報告 (TXT)", data=export_content, file_name=f"{target_symbol}_AI_Report.txt")
 
