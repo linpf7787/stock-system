@@ -6,6 +6,11 @@ from plotly.subplots import make_subplots
 import google.generativeai as genai
 from datetime import datetime
 import requests
+import urllib3
+import io
+
+# 隱藏略過 SSL 驗證時產生的警告訊息
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # 設定網頁標題與佈局
 st.set_page_config(page_title="AI 股票分析與進階指標系統", layout="wide")
@@ -20,31 +25,28 @@ if 'selected_symbol' not in st.session_state:
 
 @st.cache_data(ttl=86400) # 快取一天，避免頻繁重複爬取證交所網站
 def get_taiwan_stock_list():
-    """從證交所與櫃買中心抓取最新股票代碼與名稱對照表"""
+    """從證交所與櫃買中心抓取最新股票代碼與名稱對照表 (已修復 SSL 憑證問題)"""
     try:
         def process_df(url, suffix):
-            # 加上 User-Agent 避免被阻擋
             headers = {'User-Agent': 'Mozilla/5.0'}
-            res = requests.get(url, headers=headers)
-            res.encoding = 'big5' # 證交所網頁編碼
-            dfs = pd.read_html(res.text)
+            # 加上 verify=False 略過憑證驗證
+            res = requests.get(url, headers=headers, verify=False)
+            res.encoding = 'big5' 
+            
+            # 使用 io.StringIO 避免 pandas 警告
+            dfs = pd.read_html(io.StringIO(res.text))
             df = dfs[0]
             
-            # 第一欄位包含「代號　名稱」，中間是全形空白
             col = df.columns[0]
-            # 過濾出包含全形空白的資料列
             df = df[df[col].astype(str).str.contains('　')]
             
-            # 分割代碼與名稱
             split_data = df[col].astype(str).str.split('　', n=1, expand=True)
             split_data.columns = ['Ticker', 'Name']
-            split_data['Symbol'] = split_data['Ticker'] + suffix # 組合 YF 代碼
+            split_data['Symbol'] = split_data['Ticker'] + suffix
             
-            # 確保代碼是英數字 (排除一些奇怪的格式)
             split_data = split_data[split_data['Ticker'].str.isalnum()]
             return split_data
 
-        # 抓取上市 (.TW) 與 上櫃 (.TWO)
         df_tw = process_df("https://isin.twse.com.tw/isin/C_public.jsp?strMode=2", ".TW")
         df_two = process_df("https://isin.twse.com.tw/isin/C_public.jsp?strMode=4", ".TWO")
         
@@ -151,20 +153,19 @@ with st.sidebar:
 st.title("📊 股票進階指標與 AI 分析系統")
 st.markdown("支援輸入 **股票名稱** (如: 友達、台積電) 或 **代碼** (如: 2409、2330)")
 
-# 第一步：搜尋區塊
+# 搜尋區塊
 col_s1, col_s2 = st.columns([4, 1])
 with col_s1:
     search_query = st.text_input("輸入名稱或代碼後按下搜尋：", key="search_input")
 with col_s2:
-    st.write("") # 排版用
+    st.write("") 
     st.write("")
     if st.button("🔍 搜尋標的"):
         if not stock_df.empty and search_query:
-            # 支援模糊比對代碼或名稱
             mask = stock_df['Ticker'].str.contains(search_query) | stock_df['Name'].str.contains(search_query)
             st.session_state['search_results'] = stock_df[mask]
 
-# 第二步：選單區塊 (如果有搜尋結果)
+# 選單區塊
 if not st.session_state['search_results'].empty:
     st.markdown("---")
     results_df = st.session_state['search_results']
@@ -177,7 +178,6 @@ if not st.session_state['search_results'].empty:
         analyze_btn = st.button("進行深度分析", type="primary")
     with col_a2:
         if st.button("加入我的最愛 ❤️"):
-            # 解析選單文字取得代碼與名稱
             sel_ticker = selected_option.split(" ")[0]
             sel_name = selected_option.split(" ")[1]
             sel_symbol = selected_option.split("(")[-1].replace(")", "")
@@ -188,12 +188,11 @@ if not st.session_state['search_results'].empty:
                 st.success(f"已將 {sel_name} 加入最愛！")
                 st.rerun()
                 
-    # 將選擇的代碼寫入 session 以便執行
     if analyze_btn:
         st.session_state['selected_symbol'] = selected_option.split("(")[-1].replace(")", "")
         st.session_state['display_name'] = selected_option.split(" (")[0]
 
-# 第三步：分析與圖表區塊
+# 分析與圖表區塊
 if st.session_state['selected_symbol']:
     st.markdown("---")
     target_symbol = st.session_state['selected_symbol']
