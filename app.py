@@ -23,36 +23,31 @@ if 'search_results' not in st.session_state:
 if 'selected_symbol' not in st.session_state:
     st.session_state['selected_symbol'] = ""
 
-@st.cache_data(ttl=86400) # 快取一天，避免頻繁重複爬取證交所網站
+@st.cache_data(ttl=86400)
 def get_taiwan_stock_list():
-    """從證交所與櫃買中心抓取最新股票代碼與名稱對照表 (已修復 SSL 憑證問題)"""
+    """從證交所與櫃買中心抓取對照表 (具備雲端防錯機制)"""
     try:
         def process_df(url, suffix):
             headers = {'User-Agent': 'Mozilla/5.0'}
-            # 加上 verify=False 略過憑證驗證
-            res = requests.get(url, headers=headers, verify=False)
+            res = requests.get(url, headers=headers, verify=False, timeout=10)
             res.encoding = 'big5' 
-            
-            # 使用 io.StringIO 避免 pandas 警告
             dfs = pd.read_html(io.StringIO(res.text))
             df = dfs[0]
-            
             col = df.columns[0]
             df = df[df[col].astype(str).str.contains('　')]
-            
             split_data = df[col].astype(str).str.split('　', n=1, expand=True)
             split_data.columns = ['Ticker', 'Name']
             split_data['Symbol'] = split_data['Ticker'] + suffix
-            
             split_data = split_data[split_data['Ticker'].str.isalnum()]
             return split_data
 
         df_tw = process_df("https://isin.twse.com.tw/isin/C_public.jsp?strMode=2", ".TW")
         df_two = process_df("https://isin.twse.com.tw/isin/C_public.jsp?strMode=4", ".TWO")
-        
         return pd.concat([df_tw, df_two], ignore_index=True)
-    except Exception as e:
-        st.error(f"⚠️ 無法取得台股對照表，請稍後再試。錯誤訊息: {e}")
+        
+    except Exception:
+        # 如果被證交所阻擋，不顯示紅框，改顯示溫和提示並回傳空表
+        st.warning("ℹ️ 雲端主機目前無法連線至證交所取得「中文名稱對照表」。請直接在下方輸入代碼 (上市加 .TW，上櫃加 .TWO，如 2330.TW) 即可正常分析！")
         return pd.DataFrame()
 
 def get_stock_data(ticker):
@@ -62,16 +57,13 @@ def get_stock_data(ticker):
     info = stock.info
     
     if not hist.empty:
-        # MA
         hist['5MA'] = hist['Close'].rolling(window=5).mean()
         hist['20MA'] = hist['Close'].rolling(window=20).mean()
-        # KD
         hist['9MA_Max'] = hist['High'].rolling(window=9).max()
         hist['9MA_Min'] = hist['Low'].rolling(window=9).min()
         hist['RSV'] = 100 * (hist['Close'] - hist['9MA_Min']) / (hist['9MA_Max'] - hist['9MA_Min'])
         hist['K'] = hist['RSV'].ewm(com=2, adjust=False).mean()
         hist['D'] = hist['K'].ewm(com=2, adjust=False).mean()
-        # MACD
         hist['EMA12'] = hist['Close'].ewm(span=12, adjust=False).mean()
         hist['EMA26'] = hist['Close'].ewm(span=26, adjust=False).mean()
         hist['DIF'] = hist['EMA12'] - hist['EMA26']
@@ -104,10 +96,11 @@ def plot_kline(hist, ticker_name):
     return fig
 
 def generate_gemini_analysis(ticker, hist, info, api_key):
-    """呼叫 Gemini 產生分析報告"""
+    """呼叫 Gemini 產生分析報告 (修復 404 問題)"""
     try:
         genai.configure(api_key=api_key)
-        model = genai.GenerativeModel('gemini-1.5-flash') 
+        # 更新為最新的模型後綴
+        model = genai.GenerativeModel('gemini-1.5-flash-latest') 
         
         latest = hist.iloc[-1]
         prompt = f"""
@@ -151,21 +144,26 @@ with st.sidebar:
 
 # --- 網頁主畫面 ---
 st.title("📊 股票進階指標與 AI 分析系統")
-st.markdown("支援輸入 **股票名稱** (如: 友達、台積電) 或 **代碼** (如: 2409、2330)")
+st.markdown("支援輸入 **股票名稱** (如: 友達) 或 **代碼** (如: 2409.TW)")
 
 # 搜尋區塊
 col_s1, col_s2 = st.columns([4, 1])
 with col_s1:
-    search_query = st.text_input("輸入名稱或代碼後按下搜尋：", key="search_input")
+    search_query = st.text_input("輸入名稱或代碼 (若查無選單請直接輸入代碼如 2330.TW)：", key="search_input")
 with col_s2:
     st.write("") 
     st.write("")
     if st.button("🔍 搜尋標的"):
+        # 如果有載入清單，則進行模糊搜尋
         if not stock_df.empty and search_query:
             mask = stock_df['Ticker'].str.contains(search_query) | stock_df['Name'].str.contains(search_query)
             st.session_state['search_results'] = stock_df[mask]
+        else:
+            # 若無清單 (被阻擋)，直接將輸入的內容作為代碼去分析
+            st.session_state['selected_symbol'] = search_query.upper()
+            st.session_state['display_name'] = search_query.upper()
 
-# 選單區塊
+# 選單區塊 (有抓到對照表才顯示)
 if not st.session_state['search_results'].empty:
     st.markdown("---")
     results_df = st.session_state['search_results']
@@ -191,6 +189,11 @@ if not st.session_state['search_results'].empty:
     if analyze_btn:
         st.session_state['selected_symbol'] = selected_option.split("(")[-1].replace(")", "")
         st.session_state['display_name'] = selected_option.split(" (")[0]
+elif search_query and stock_df.empty:
+    # 沒抓到表單時的直接分析按鈕
+    if st.button("進行深度分析", type="primary"):
+        st.session_state['selected_symbol'] = search_query.upper()
+        st.session_state['display_name'] = search_query.upper()
 
 # 分析與圖表區塊
 if st.session_state['selected_symbol']:
@@ -219,4 +222,4 @@ if st.session_state['selected_symbol']:
                 display_df = hist_data[['Close', 'Volume', '5MA', '20MA', 'K', 'D', 'MACD', 'OSC']].tail(10).sort_index(ascending=False)
                 st.dataframe(display_df.round(2))
         else:
-            st.error("擷取股價資料失敗，可能是該股票近期暫停交易或代碼有誤。")
+            st.error("擷取股價資料失敗，請確認輸入的代碼格式 (如: 2330.TW)。")
