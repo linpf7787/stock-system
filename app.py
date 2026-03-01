@@ -8,24 +8,108 @@ from datetime import datetime
 import requests
 import urllib3
 import io
+import sqlite3
+import hashlib
 
 # 隱藏略過 SSL 驗證時產生的警告訊息
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # 設定網頁標題與佈局
-st.set_page_config(page_title="AI 股票分析與進階指標系統", layout="wide")
+st.set_page_config(page_title="AI 股票分析與進階指標系統 (多用戶版)", layout="wide")
 
-# 初始化 Session State
-if 'favorites' not in st.session_state:
-    st.session_state['favorites'] = []
-if 'search_results' not in st.session_state:
-    st.session_state['search_results'] = pd.DataFrame()
-if 'selected_symbol' not in st.session_state:
-    st.session_state['selected_symbol'] = ""
+# ==========================================
+# 🗄️ 資料庫設定與操作函數
+# ==========================================
+def init_db():
+    """初始化 SQLite 資料庫與資料表"""
+    conn = sqlite3.connect('stock_app.db', check_same_thread=False)
+    c = conn.cursor()
+    # 用戶表
+    c.execute('''CREATE TABLE IF NOT EXISTS users
+                 (id INTEGER PRIMARY KEY AUTOINCREMENT, 
+                  username TEXT UNIQUE, 
+                  password TEXT, 
+                  api_key TEXT)''')
+    # 我的最愛表 (紀錄報告與時間)
+    c.execute('''CREATE TABLE IF NOT EXISTS favorites
+                 (id INTEGER PRIMARY KEY AUTOINCREMENT, 
+                  user_id INTEGER, 
+                  ticker TEXT, 
+                  name TEXT, 
+                  symbol TEXT, 
+                  report TEXT, 
+                  update_time TEXT)''')
+    conn.commit()
+    conn.close()
 
+def hash_pw(password):
+    """將密碼進行 SHA-256 加密"""
+    return hashlib.sha256(password.encode()).hexdigest()
+
+def register_user(username, password):
+    conn = sqlite3.connect('stock_app.db')
+    c = conn.cursor()
+    try:
+        c.execute("INSERT INTO users (username, password, api_key) VALUES (?, ?, '')", (username, hash_pw(password)))
+        conn.commit()
+        return True
+    except sqlite3.IntegrityError:
+        return False # 帳號已存在
+    finally:
+        conn.close()
+
+def authenticate_user(username, password):
+    conn = sqlite3.connect('stock_app.db')
+    c = conn.cursor()
+    c.execute("SELECT id, api_key FROM users WHERE username=? AND password=?", (username, hash_pw(password)))
+    user = c.fetchone()
+    conn.close()
+    return user # 回傳 (id, api_key) 或 None
+
+def update_api_key_db(user_id, api_key):
+    conn = sqlite3.connect('stock_app.db')
+    c = conn.cursor()
+    c.execute("UPDATE users SET api_key=? WHERE id=?", (api_key, user_id))
+    conn.commit()
+    conn.close()
+
+def get_favorites(user_id):
+    conn = sqlite3.connect('stock_app.db')
+    df = pd.read_sql_query("SELECT * FROM favorites WHERE user_id=?", conn, params=(user_id,))
+    conn.close()
+    return df
+
+def save_favorite_report(user_id, ticker, name, symbol, report):
+    """新增或更新我的最愛中的分析報告"""
+    conn = sqlite3.connect('stock_app.db')
+    c = conn.cursor()
+    update_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    
+    c.execute("SELECT id FROM favorites WHERE user_id=? AND symbol=?", (user_id, symbol))
+    row = c.fetchone()
+    if row:
+        c.execute("UPDATE favorites SET report=?, update_time=? WHERE id=?", (report, update_time, row[0]))
+    else:
+        c.execute("INSERT INTO favorites (user_id, ticker, name, symbol, report, update_time) VALUES (?, ?, ?, ?, ?, ?)",
+                  (user_id, ticker, name, symbol, report, update_time))
+    conn.commit()
+    conn.close()
+
+def remove_favorite(user_id, symbol):
+    conn = sqlite3.connect('stock_app.db')
+    c = conn.cursor()
+    c.execute("DELETE FROM favorites WHERE user_id=? AND symbol=?", (user_id, symbol))
+    conn.commit()
+    conn.close()
+
+# 初始化資料庫
+init_db()
+
+# ==========================================
+# 🔄 股票資料與 AI 分析函數 (保留原有邏輯)
+# ==========================================
 @st.cache_data(ttl=86400)
 def get_taiwan_stock_list():
-    """從證交所與櫃買中心抓取對照表 (具備雲端防錯機制)"""
     try:
         def process_df(url, suffix):
             headers = {'User-Agent': 'Mozilla/5.0'}
@@ -40,22 +124,16 @@ def get_taiwan_stock_list():
             split_data['Symbol'] = split_data['Ticker'] + suffix
             split_data = split_data[split_data['Ticker'].str.isalnum()]
             return split_data
-
         df_tw = process_df("https://isin.twse.com.tw/isin/C_public.jsp?strMode=2", ".TW")
         df_two = process_df("https://isin.twse.com.tw/isin/C_public.jsp?strMode=4", ".TWO")
         return pd.concat([df_tw, df_two], ignore_index=True)
-        
     except Exception:
-        # 如果被證交所阻擋，不顯示紅框，改顯示溫和提示並回傳空表
-        st.warning("ℹ️ 雲端主機目前無法連線至證交所取得「中文名稱對照表」。請直接在下方輸入代碼 (上市加 .TW，上櫃加 .TWO，如 2330.TW) 即可正常分析！")
         return pd.DataFrame()
 
 def get_stock_data(ticker):
-    """取得股票歷史資料並計算進階技術指標"""
     stock = yf.Ticker(ticker)
     hist = stock.history(period="1y")
     info = stock.info
-    
     if not hist.empty:
         hist['5MA'] = hist['Close'].rolling(window=5).mean()
         hist['20MA'] = hist['Close'].rolling(window=20).mean()
@@ -69,180 +147,251 @@ def get_stock_data(ticker):
         hist['DIF'] = hist['EMA12'] - hist['EMA26']
         hist['MACD'] = hist['DIF'].ewm(span=9, adjust=False).mean()
         hist['OSC'] = hist['DIF'] - hist['MACD']
-        
     return hist.tail(120), info
 
 def plot_kline(hist, ticker_name):
-    """繪製包含 K線、MA、MACD、KD 的多重圖表"""
-    fig = make_subplots(rows=3, cols=1, shared_xaxes=True, 
-                        vertical_spacing=0.05, 
-                        row_heights=[0.5, 0.25, 0.25])
-    
+    fig = make_subplots(rows=3, cols=1, shared_xaxes=True, vertical_spacing=0.05, row_heights=[0.5, 0.25, 0.25])
     fig.add_trace(go.Candlestick(x=hist.index, open=hist['Open'], high=hist['High'], low=hist['Low'], close=hist['Close'], name='K線'), row=1, col=1)
     fig.add_trace(go.Scatter(x=hist.index, y=hist['5MA'], line=dict(color='orange', width=1.5), name='5MA'), row=1, col=1)
     fig.add_trace(go.Scatter(x=hist.index, y=hist['20MA'], line=dict(color='blue', width=1.5), name='20MA'), row=1, col=1)
-    
     colors = ['red' if val >= 0 else 'green' for val in hist['OSC']]
     fig.add_trace(go.Bar(x=hist.index, y=hist['OSC'], marker_color=colors, name='MACD柱狀圖'), row=2, col=1)
     fig.add_trace(go.Scatter(x=hist.index, y=hist['DIF'], line=dict(color='orange', width=1.5), name='DIF'), row=2, col=1)
     fig.add_trace(go.Scatter(x=hist.index, y=hist['MACD'], line=dict(color='blue', width=1.5), name='MACD'), row=2, col=1)
-    
     fig.add_trace(go.Scatter(x=hist.index, y=hist['K'], line=dict(color='orange', width=1.5), name='K值'), row=3, col=1)
     fig.add_trace(go.Scatter(x=hist.index, y=hist['D'], line=dict(color='blue', width=1.5), name='D值'), row=3, col=1)
     fig.add_hline(y=80, line_dash="dot", line_color="red", row=3, col=1)
     fig.add_hline(y=20, line_dash="dot", line_color="green", row=3, col=1)
-
+    fig.add_layout_image(
+        dict(source="https://upload.wikimedia.org/wikipedia/commons/thumb/c/c1/Google_%22G%22_logo.svg/1024px-Google_%22G%22_logo.svg.png",
+             xref="paper", yref="paper", x=0.5, y=0.5, sizex=0.3, sizey=0.3, xanchor="center", yanchor="middle", opacity=0.05, layer="below")
+    )
     fig.update_layout(title=f"{ticker_name} 進階技術分析", xaxis_rangeslider_visible=False, height=750)
     return fig
 
 def generate_gemini_analysis(ticker, hist, info, api_key):
-    """呼叫 Gemini 產生分析報告 (終極防錯版：自動尋找可用模型)"""
     try:
         genai.configure(api_key=api_key)
-        
-        # 🔍 自動尋找您的 API Key 真正支援的模型
         valid_model_name = ""
         for m in genai.list_models():
             if 'generateContent' in m.supported_generation_methods:
-                # 優先選擇含有 flash 或 pro 的最新模型
                 if 'flash' in m.name or 'pro' in m.name:
                     valid_model_name = m.name
                     break
-        
-        # 如果沒找到 flash 或 pro，就挑選清單中第一個支援生成的模型
         if not valid_model_name:
             for m in genai.list_models():
                 if 'generateContent' in m.supported_generation_methods:
                     valid_model_name = m.name
                     break
-                    
         if not valid_model_name:
-            return "⚠️ 您的 API Key 目前無法存取任何文字生成模型，請確認 Google AI Studio 帳號狀態。", None
+            return "⚠️ 您的 API Key 無法存取文字生成模型。", None
 
-        # 使用系統自動找到的合法模型
         model = genai.GenerativeModel(valid_model_name) 
-        
         latest = hist.iloc[-1]
         prompt = f"""
-        你是一位極具實戰經驗的台股操盤手。請根據以下 {ticker} 的最新進階技術與基本面數據，撰寫一份約 400 字的實戰分析報告。
-        【最新關鍵數據】
-        - 收盤價：{latest['Close']:.2f}
-        - 均線狀態：5日線({latest['5MA']:.2f}), 月線({latest['20MA']:.2f})
-        - KD指標：K值({latest['K']:.2f}), D值({latest['D']:.2f})
-        - MACD指標：DIF({latest['DIF']:.2f}), MACD({latest['MACD']:.2f}), 柱狀圖OSC({latest['OSC']:.2f})
+        你是一位極具實戰經驗的台股操盤手。請根據以下 {ticker} 的最新進階技術與基本面數據，撰寫約 400 字的實戰分析報告。
+        - 收盤價：{latest['Close']:.2f} | 5MA({latest['5MA']:.2f}) | 20MA({latest['20MA']:.2f})
+        - KD指標：K({latest['K']:.2f}) | D({latest['D']:.2f})
+        - MACD：DIF({latest['DIF']:.2f}) | MACD({latest['MACD']:.2f}) | OSC({latest['OSC']:.2f})
         - 評價面：PB比({info.get('priceToBook', 'N/A')}), PE比({info.get('trailingPE', 'N/A')})
-        
-        【報告要求】：
-        1. 📈 多指標綜合診斷：趨勢與動能評估。
-        2. 🎯 進場時機與條件：尚未持股者的建倉建議與條件。
-        3. 🛑 離場時機：已持股者的停損/停利防守點及技術訊號。
-        4. 💡 總結建議：一句話總結策略。
+        要求包含：1.多指標綜合診斷 2.進場時機與條件 3.離場/防守點時機 4.一句話總結。
         """
         response = model.generate_content(prompt)
-        
-        # 在報告開頭印出這次成功使用的模型名稱，方便我們確認
-        final_report = f"*(系統自動選用模型: {valid_model_name})*\n\n" + response.text
-        return final_report, latest
-        
+        return f"*(模型: {valid_model_name})*\n\n" + response.text, latest
     except Exception as e:
         return f"⚠️ AI 分析錯誤：{e}", None
-# --- 載入台股清單 ---
+
+# ==========================================
+# 🖥️ 使用者介面與流程控制
+# ==========================================
+if 'logged_in' not in st.session_state:
+    st.session_state['logged_in'] = False
+if 'user_id' not in st.session_state:
+    st.session_state['user_id'] = None
+if 'username' not in st.session_state:
+    st.session_state['username'] = ""
+if 'api_key' not in st.session_state:
+    st.session_state['api_key'] = ""
+
+# --- 登入/註冊畫面 ---
+if not st.session_state['logged_in']:
+    st.title("🔐 AI 股票分析系統 - 登入")
+    tab1, tab2 = st.tabs(["登入", "註冊新帳號"])
+    
+    with tab1:
+        login_user = st.text_input("帳號", key="login_user")
+        login_pw = st.text_input("密碼", type="password", key="login_pw")
+        if st.button("登入系統", type="primary"):
+            user = authenticate_user(login_user, login_pw)
+            if user:
+                st.session_state['logged_in'] = True
+                st.session_state['user_id'] = user[0]
+                st.session_state['username'] = login_user
+                st.session_state['api_key'] = user[1] if user[1] else ""
+                st.success("登入成功！")
+                st.rerun()
+            else:
+                st.error("帳號或密碼錯誤。")
+                
+    with tab2:
+        reg_user = st.text_input("設定帳號", key="reg_user")
+        reg_pw = st.text_input("設定密碼", type="password", key="reg_pw")
+        reg_pw2 = st.text_input("確認密碼", type="password", key="reg_pw2")
+        if st.button("註冊"):
+            if reg_pw != reg_pw2:
+                st.error("兩次密碼輸入不一致")
+            elif reg_user and reg_pw:
+                if register_user(reg_user, reg_pw):
+                    st.success("註冊成功！請切換到「登入」標籤登入系統。")
+                else:
+                    st.error("此帳號已被使用，請換一個。")
+    st.stop() # 停止執行後續的主畫面程式碼
+
+# --- 登入後的主畫面系統 ---
+# 初始化狀態
+if 'search_results' not in st.session_state:
+    st.session_state['search_results'] = pd.DataFrame()
+if 'selected_symbol' not in st.session_state:
+    st.session_state['selected_symbol'] = ""
+if 'current_report' not in st.session_state:
+    st.session_state['current_report'] = ""
+if 'report_time' not in st.session_state:
+    st.session_state['report_time'] = ""
+if 'needs_new_analysis' not in st.session_state:
+    st.session_state['needs_new_analysis'] = False
+
 stock_df = get_taiwan_stock_list()
 
-# --- 網頁側邊欄 ---
+# --- 側邊欄 ---
 with st.sidebar:
-    st.header("🔑 設定區")
-    api_key = st.text_input("輸入 Gemini API Key", type="password")
+    st.markdown(f"### 👤 歡迎, **{st.session_state['username']}**")
+    if st.button("🚪 登出系統"):
+        st.session_state.clear()
+        st.rerun()
+        
+    st.markdown("---")
+    st.header("🔑 API 設定")
+    new_api_key = st.text_input("Gemini API Key", value=st.session_state['api_key'], type="password")
+    if new_api_key != st.session_state['api_key']:
+        st.session_state['api_key'] = new_api_key
+        update_api_key_db(st.session_state['user_id'], new_api_key)
+        st.success("API Key 已儲存！")
     
     st.markdown("---")
     st.header("⭐ 我的最愛")
-    if st.session_state['favorites']:
-        for fav_dict in st.session_state['favorites']:
-            display_name = f"{fav_dict['Ticker']} {fav_dict['Name']}"
-            if st.button(display_name, key=f"btn_{fav_dict['Ticker']}"):
-                st.session_state['selected_symbol'] = fav_dict['Symbol']
-                st.session_state['display_name'] = display_name
+    fav_df = get_favorites(st.session_state['user_id'])
+    
+    if not fav_df.empty:
+        for index, row in fav_df.iterrows():
+            if st.button(f"{row['Ticker']} {row['Name']}", key=f"fav_{row['Symbol']}", use_container_width=True):
+                # 點擊最愛時：讀取資料庫中的舊報告，不重新分析
+                st.session_state['selected_symbol'] = row['Symbol']
+                st.session_state['display_name'] = f"{row['Ticker']} {row['Name']}"
+                st.session_state['current_report'] = row['report']
+                st.session_state['report_time'] = row['update_time']
+                st.session_state['needs_new_analysis'] = False
     else:
-        st.write("目前尚無最愛名單。")
+        st.write("尚無收藏。在分析後可點擊愛心加入。")
 
-# --- 網頁主畫面 ---
+# --- 主畫面區塊 ---
 st.title("📊 股票進階指標與 AI 分析系統")
-st.markdown("支援輸入 **股票名稱** (如: 友達) 或 **代碼** (如: 2409.TW)")
 
-# 搜尋區塊
+# 1. 搜尋區
 col_s1, col_s2 = st.columns([4, 1])
 with col_s1:
-    search_query = st.text_input("輸入名稱或代碼 (若查無選單請直接輸入代碼如 2330.TW)：", key="search_input")
+    search_query = st.text_input("輸入名稱或代碼 (如: 友達, 2409.TW)：", key="search_input")
 with col_s2:
     st.write("") 
     st.write("")
     if st.button("🔍 搜尋標的"):
-        # 如果有載入清單，則進行模糊搜尋
         if not stock_df.empty and search_query:
             mask = stock_df['Ticker'].str.contains(search_query) | stock_df['Name'].str.contains(search_query)
             st.session_state['search_results'] = stock_df[mask]
         else:
-            # 若無清單 (被阻擋)，直接將輸入的內容作為代碼去分析
             st.session_state['selected_symbol'] = search_query.upper()
             st.session_state['display_name'] = search_query.upper()
+            st.session_state['needs_new_analysis'] = True
 
-# 選單區塊 (有抓到對照表才顯示)
+# 2. 選單區 (如果有搜尋到)
 if not st.session_state['search_results'].empty:
     st.markdown("---")
     results_df = st.session_state['search_results']
     options = results_df['Ticker'] + " " + results_df['Name'] + " (" + results_df['Symbol'] + ")"
+    selected_option = st.selectbox("👉 請選擇精確標的：", options.tolist())
     
-    selected_option = st.selectbox("👉 請選擇您要分析的精確標的：", options.tolist())
-    
-    col_a1, col_a2 = st.columns([1, 5])
-    with col_a1:
-        analyze_btn = st.button("進行深度分析", type="primary")
-    with col_a2:
-        if st.button("加入我的最愛 ❤️"):
-            sel_ticker = selected_option.split(" ")[0]
-            sel_name = selected_option.split(" ")[1]
-            sel_symbol = selected_option.split("(")[-1].replace(")", "")
-            
-            fav_item = {"Ticker": sel_ticker, "Name": sel_name, "Symbol": sel_symbol}
-            if fav_item not in st.session_state['favorites']:
-                st.session_state['favorites'].append(fav_item)
-                st.success(f"已將 {sel_name} 加入最愛！")
-                st.rerun()
-                
-    if analyze_btn:
+    if st.button("進行深度分析", type="primary"):
+        # 進行全新搜尋時，強制重新分析
         st.session_state['selected_symbol'] = selected_option.split("(")[-1].replace(")", "")
         st.session_state['display_name'] = selected_option.split(" (")[0]
-elif search_query and stock_df.empty:
-    # 沒抓到表單時的直接分析按鈕
-    if st.button("進行深度分析", type="primary"):
-        st.session_state['selected_symbol'] = search_query.upper()
-        st.session_state['display_name'] = search_query.upper()
+        st.session_state['needs_new_analysis'] = True
 
-# 分析與圖表區塊
+# 3. 分析與圖表呈現區塊
 if st.session_state['selected_symbol']:
     st.markdown("---")
     target_symbol = st.session_state['selected_symbol']
     display_title = st.session_state.get('display_name', target_symbol)
+    user_id = st.session_state['user_id']
     
-    with st.spinner(f'正在分析 {display_title} 的進階指標與產出報告...'):
-        hist_data, stock_info = get_stock_data(target_symbol)
+    hist_data, stock_info = get_stock_data(target_symbol)
+    
+    if not hist_data.empty:
+        # K線圖(永遠抓最新報價來畫圖)
+        st.plotly_chart(plot_kline(hist_data, display_title), use_container_width=True)
         
-        if not hist_data.empty:
-            st.plotly_chart(plot_kline(hist_data, display_title), use_container_width=True)
-            
-            st.markdown("### 🤖 專屬 AI 操盤手報告")
-            if api_key:
-                ai_report, latest_data = generate_gemini_analysis(display_title, hist_data, stock_info, api_key)
-                st.info(ai_report)
-                
-                if latest_data is not None:
-                    export_content = f"【{display_title} AI 實戰分析】\n產出時間:{datetime.now().strftime('%Y-%m-%d %H:%M')}\n\n{ai_report}"
-                    st.download_button("📥 下載分析報告 (TXT)", data=export_content, file_name=f"{target_symbol}_AI_Report.txt")
+        # 準備 AI 報告
+        st.markdown("### 🤖 專屬 AI 操盤手報告")
+        
+        # 判斷是否需要呼叫 API 產生新報告
+        if st.session_state['needs_new_analysis']:
+            if st.session_state['api_key']:
+                with st.spinner('正在為您產生最新 AI 分析...'):
+                    ai_report, latest_data = generate_gemini_analysis(display_title, hist_data, stock_info, st.session_state['api_key'])
+                    st.session_state['current_report'] = ai_report
+                    st.session_state['report_time'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                    st.session_state['needs_new_analysis'] = False
+                    
+                    # 如果這檔股票已經在最愛清單，自動更新資料庫裡的報告
+                    if target_symbol in fav_df['Symbol'].values:
+                        ticker = display_title.split(" ")[0] if " " in display_title else target_symbol
+                        save_favorite_report(user_id, ticker, display_title, target_symbol, ai_report)
             else:
-                st.warning("請在側邊欄輸入 Gemini API Key 啟用 AI 分析。")
-                
-            with st.expander("查看近期數據"):
-                display_df = hist_data[['Close', 'Volume', '5MA', '20MA', 'K', 'D', 'MACD', 'OSC']].tail(10).sort_index(ascending=False)
-                st.dataframe(display_df.round(2))
-        else:
-            st.error("擷取股價資料失敗，請確認輸入的代碼格式 (如: 2330.TW)。")
+                st.warning("⚠️ 請先在左側邊欄設定您的 Gemini API Key。")
+        
+        # 顯示報告與操作按鈕
+        if st.session_state['current_report']:
+            st.caption(f"🕒 報告產出時間: {st.session_state['report_time']} (圖表報價為即時讀取)")
+            st.info(st.session_state['current_report'])
+            
+            # 檢查是否已在最愛名單中
+            is_fav = target_symbol in fav_df['Symbol'].values
+            
+            col_b1, col_b2, col_b3 = st.columns([2, 2, 4])
+            with col_b1:
+                if is_fav:
+                    # 如果是最愛，顯示「重新取得」與「移除」按鈕
+                    if st.button("🔄 重新取得最新 AI 分析", use_container_width=True):
+                        st.session_state['needs_new_analysis'] = True
+                        st.rerun()
+            with col_b2:
+                if is_fav:
+                    if st.button("💔 移除最愛", use_container_width=True):
+                        remove_favorite(user_id, target_symbol)
+                        st.success("已移除！")
+                        st.rerun()
+                else:
+                    # 如果不是最愛，顯示「加入最愛」按鈕
+                    if st.button("❤️ 將此報告加入我的最愛", use_container_width=True, type="primary"):
+                        ticker = display_title.split(" ")[0] if " " in display_title else target_symbol
+                        save_favorite_report(user_id, ticker, display_title, target_symbol, st.session_state['current_report'])
+                        st.success("已儲存報告至最愛！")
+                        st.rerun()
+            
+            # 下載 TXT 功能
+            export_content = f"【{display_title} AI 實戰分析】\n產出時間:{st.session_state['report_time']}\n\n{st.session_state['current_report']}"
+            st.download_button("📥 下載此份報告 (TXT)", data=export_content, file_name=f"{target_symbol}_AI_Report.txt")
+
+        with st.expander("查看近期數據明細"):
+            display_df = hist_data[['Close', 'Volume', '5MA', '20MA', 'K', 'D', 'MACD', 'OSC']].tail(10).sort_index(ascending=False)
+            st.dataframe(display_df.round(2))
+    else:
+        st.error("擷取股價資料失敗，請確認代碼是否正確。")
